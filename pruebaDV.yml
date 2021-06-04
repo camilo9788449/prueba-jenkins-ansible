@@ -1,0 +1,255 @@
+---
+- name: integración continua y despliegue continuo
+  hosts: webserver
+  become: yes
+
+  vars_prompt:
+   - name: "rama"
+     prompt: "Ingrese la rama a desplegar"
+     private: no
+     default: master
+
+   - name: "version"
+     prompt: "ingrese la version"
+     private: no
+     default: v_0
+
+   - name: "user"
+     prompt: "ingrese el usuario administrador del wildfly"
+     private: yes
+     default: Admin
+
+   - name: "password"
+     prompt: "Ingresa la contraseña del usuario administrador del wildfly"
+     private: yes
+     confirm: yes
+     salt_size: 8
+
+  vars:
+   - repositorio: "https://github.com/abcnick/Prueba-pipeline.git"
+
+   - proy_codigo: "/home/ubuntu/ansible-proyecto/ansible-proyecto-codigo"
+
+   - proy_codigo_compilado: "/home/ubuntu/ansible-proyecto/ansible-proyecto-codigo/target"
+
+   - proy_contenedor: "wildfly:/opt/jboss/wildfly/standalone/deployments"
+
+   - backup_prod: "/home/ubuntu/ansible-proyecto/ansible-proyecto-backups/prod"
+
+   - backup_dev: "/home/ubuntu/ansible-proyecto/ansible-proyecto-backups/dev"
+
+   - backup_qa: "/home/ubuntu/ansible-proyecto/ansible-proyecto-backups/qa"
+
+   - repositorio_dockerfile: "/home/ubuntu/dockerfile/Dockerfile"
+
+   - directorio_dockerfile: "/home/ubuntu/dockerfile"
+
+   - Nom_imagen: "jboss/wildfly-admin-final"
+
+   - Nom_cont: "wildfly"
+
+
+  tasks:
+
+   - name: installa dipendenze
+     apt:
+       name: "{{item}}"
+       state: present
+       update_cache: yes
+     loop:
+       - apt-transport-https
+       - ca-certificates
+       - curl
+       - gnupg-agent
+       - software-properties-common
+
+   - name: aggiungi chiave GPG
+     apt_key:
+       url: https://download.docker.com/linux/ubuntu/gpg
+       state: present
+
+   - name: aggiungi repository docker
+     apt_repository:
+       repo: deb https://download.docker.com/linux/ubuntu bionic stable
+       state: present
+
+   - name: installa docker
+     apt:
+       name: "{{item}}"
+       state: latest
+       update_cache: yes
+     loop:
+       - docker-ce
+       - docker-ce-cli
+       - containerd.io
+
+   - name: assicurati che docker sia attivo
+     service:
+       name: docker
+       state: started
+       enabled: yes
+
+   - name: Install Maven using Ansible
+     become: yes
+     apt:
+       name: "{{ packages }}"
+       state: present
+     vars:
+       packages:
+         - maven
+
+   - name: Crear dockerfile
+     file:
+       path: "{{ repositorio_dockerfile }}"
+       state: touch
+     tags:
+     - crear_dockerfile
+
+   - name: dockerfile fase 1
+     lineinfile:
+       path: "{{ repositorio_dockerfile }}"
+       line: 'FROM jboss/wildfly:23.0.0.Final'
+     tags:
+     - fases_imagenes
+
+   - name: dockerfile fase 2
+     lineinfile:
+       path: "{{ repositorio_dockerfile }}"
+       insertafter: '^#Final'
+       line: 'RUN /opt/jboss/wildfly/bin/add-user.sh "{{ user }}" "{{ password }}" --silent'
+     tags:
+     - fases_imagenes
+
+   - name: dockerfile fase 3
+     lineinfile:
+       path: "{{ repositorio_dockerfile }}"
+       insertafter: '^#silent '
+       line: 'CMD ["/opt/jboss/wildfly/bin/standalone.sh", "-b", "0.0.0.0", "-bmanagement", "0.0.0.0"]'
+     tags:
+     - fases_imagenes
+
+   - name: Construir Imagen
+     command: docker build --tag="{{ Nom_imagen }}" .
+
+     args:
+         chdir: "{{ directorio_dockerfile }}"
+     tags:
+     - Contruir_imagen
+
+   - name: Construir Contenedor
+     command: docker run -p 49154:8080 -p 49156:9990 -d --name "{{ Nom_cont }}" -it "{{ Nom_imagen }}"
+     args:
+         chdir: /home/ubuntu
+     tags:
+     - Construir_contenedor
+
+   - name: Eliminar dockerfile
+     file:
+       path: "{{ repositorio_dockerfile }}"
+       state: absent
+     tags:
+     - eliminar_imagen
+
+   - name: Detener contenedor
+     command: docker stop "{{ Nom_cont }}"
+     args:
+         chdir: "{{ directorio_dockerfile }}"
+     tags:
+     - eliminar_contenedor
+
+   - name: Eliminar contenedor
+     command: docker rm "{{ Nom_cont }}"
+     args:
+         chdir: "{{ directorio_dockerfile }}"
+     tags:
+     - eliminar_contenedor
+
+   - name: Fecha
+     command: "date '+%Y-%m-%dT%H:%M:%S'"
+     register: date_gmt
+     environment:
+       TZ: GMT+5
+
+   - name: Clone Repo
+     git:
+       repo: "{{ repositorio }}"
+       version: "{{ rama }}"
+       dest: "{{ proy_codigo }}"
+       key_file: /etc/ssh/accessazure
+       accept_hostkey: yes
+
+   - name: Last Commit
+     command: git log -1
+     register: infocommit
+     args:
+       chdir: "{{ proy_codigo }}"
+
+   - name: Mensaje Commit
+     debug: var=infocommit.stdout_lines
+
+   - name: validacion pruebas unitarias
+     command: mvn clean test
+     register: info
+     args:
+       chdir: "{{ proy_codigo }}"
+
+   - name: datos pruebas unitarias
+     debug: var=info.stdout
+
+   - name: Compila aplicacion
+     command: mvn package
+     args:
+       chdir: "{{ proy_codigo }}"
+
+   - name: renombrar archivo
+     command: mv helloworld.war helloworld{{ version }}.war
+     args:
+       chdir: "{{ proy_codigo_compilado }}"
+
+   - name: Deploy app
+     command: docker cp helloworld{{ version }}.war "{{ proy_contenedor }}"
+     args:
+       chdir: "{{ proy_codigo_compilado }}"
+
+   - name: Copiar carpeta prod
+     when: rama == "master"
+     command: cp helloworld{{ version }}.war "{{ backup_prod }}"
+     args:
+       chdir: "{{ proy_codigo_compilado }}"
+
+   - name: Copiar carpeta dev
+     when: rama == "develop"
+     command: cp helloworld{{ version }}.war "{{ backup_dev }}"
+     args:
+       chdir: "{{ proy_codigo_compilado }}"
+
+   - name: Copiar carpeta qa
+     when: rama == "qa"
+     command: cp helloworld{{ version }}.war "{{ backup_qa }}"
+     args:
+       chdir: "{{ proy_codigo_compilado }}"
+
+   - name: Renombrar artefacto prod
+     when: rama == "master"
+     command: mv helloworld{{ version }}.war helloworld{{version}}-{{date_gmt.stdout}}.war
+     args:
+       chdir: "{{ backup_prod }}"
+
+   - name: Renombrar artefacto dev
+     when: rama == "develop"
+     command: mv helloworld{{ version }}.war helloworld{{version}}-{{date_gmt.stdout}}.war
+     args:
+       chdir: "{{ backup_dev }}"
+
+   - name: Renombrar artefacto qa
+     when: rama == "qa"
+     command: mv helloworld{{ version }}.war helloworld{{version}}-{{date_gmt.stdout}}.war
+     args:
+       chdir: "{{ backup_qa }}"
+
+  handlers:
+
+   - name: restart docker
+     service: 
+       name: docker 
+       state: restarted
